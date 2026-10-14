@@ -9,14 +9,23 @@ topology:
       binds:
         - r1/daemons:/etc/frr/daemons
         - r1/frr.conf:/etc/frr/frr.conf
+        - vtysh.conf:/etc/frr/vtysh.conf
+      exec:
+        - ip route del default
     r2:
       binds:
         - r2/daemons:/etc/frr/daemons
         - r2/frr.conf:/etc/frr/frr.conf
+        - vtysh.conf:/etc/frr/vtysh.conf
+      exec:
+        - ip route del default
     r3:
       binds:
         - r3/daemons:/etc/frr/daemons
         - r3/frr.conf:/etc/frr/frr.conf
+        - vtysh.conf:/etc/frr/vtysh.conf
+      exec:
+        - ip route del default
   links:
     - endpoints: ["r1:eth1", "r2:eth1"]
     - endpoints: ["r2:eth2", "r3:eth1"]
