@@ -2,3 +2,5 @@
 today.diff
 clab-*/
 __pycache__/
+.venv/
+agent/logs/
