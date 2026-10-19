@@ -116,6 +116,8 @@ def troubleshoot_network(problem):
         {"role": "user", "content": problem}
     ]
 
+    tool_calls = 0
+
     for step in range(1, MAX_STEPS + 1): 
         response = client.messages.create(
             model = MODEL,
@@ -124,12 +126,17 @@ def troubleshoot_network(problem):
             tools = TOOL_DEFINITION,
             messages = messages,
         )
-        print(response)
-        
         text = " ".join(b.text for b in response.content if b.type == "text")
-
+        asked = [f"{b.name}({b.input['router']})" for b in response.content if b.type == "tool_use"]
+        if asked:
+            print(f"Turn {step}: {text}  ->  {', '.join(asked)}")
+        else:
+            print(f"Turn {step}: report")
+        
         if response.stop_reason != "tool_use":
             log_step("report", {"step": step}, text, "")
+            print(f"Finished in {step} turns and {tool_calls} tool calls.")
+
             return text
 
         messages.append({"role": "assistant", "content": response.content})
@@ -138,6 +145,7 @@ def troubleshoot_network(problem):
         
         for block in response.content:
             if block.type == "tool_use":
+                tool_calls += 1
                 output, is_error = use_tool(block.name, block.input)
                 log_step(block.name, block.input, output, text)
 
@@ -152,8 +160,9 @@ def troubleshoot_network(problem):
 
     report = "Maximum number of steps reached without a diagnosis."
     log_step("report", {"step": step}, report, "")
-    return report
+    print(f"Stopped at the step limit: {MAX_STEPS} turns and {tool_calls} tool calls.")
 
+    return report
 
 if __name__ == "__main__":     
     print(troubleshoot_network(sys.argv[1]))
