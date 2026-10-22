@@ -3,7 +3,7 @@ Goal: A read-only agent that is able to find Open Shortest Path First (OSPF) fau
 Rules:
 * Propose a Plan and wait for me to agree to it before proceeding with it
 * One task at a time. If the task requires extra files, libraries, and features suggest them before adding them. 
-* Every completed task should also share a comand or test that verifies the implementation
-* Never commit without telling me what you're commiting 
+* Every completed task should also share a command or test that verifies the implementation
+* Never commit without telling me what you're committing 
 * Make sure to point to files, don't inline everything 
-* There will be a agent loop and some code that ensures sets some guardrails. Read and review them, do not rewrite any either of them
+* There will be an agent loop and some code that sets some guardrails. Read and review them, do not rewrite either of them
