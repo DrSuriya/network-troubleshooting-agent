@@ -1,242 +1,193 @@
 # OSPF Troubleshooting Agent
 
-A read-only AI agent that diagnoses OSPF faults in a three-router lab built with [FRR](https://frrouting.org/), Docker and [Containerlab](https://containerlab.dev/). The agent can only look at the routers, never change them, and it logs every step it takes.
+A read-only AI agent that diagnoses OSPF routing faults in a three-router lab built with [FRR](https://frrouting.org/), Docker and [Containerlab](https://containerlab.dev/). When prompted, it inspects the routers with five read-only tools and reports the cause, the evidence and a suggested fix. The repo also includes scripts that plant three known faults, and a benchmark that runs the agent against each one and records the results.
 
-The repo also has scripts that plant known faults and a benchmark runner that tests the agent against each one and saves the results.
+Finding the cause of a routing fault usually means logging into router after router, running show commands and comparing the outputs. This project tests whether an AI agent can do that loop safely and accurately: it can only run read-only commands, every step it takes is logged, and its accuracy is measured against faults whose cause is known. It found the planted cause in 9 of 9 scripted runs and 9 of 9 runs done by hand ([Results](#results)).
 
-**Latest results** (`claude-sonnet-5-5`, batches in [`agent/results/`](agent/results/)): in the two batches on 2026-10-20 the agent found the right cause in all 9 runs, taking 3–5 turns and 5–8 tool calls each time. It never hit the 15-turn limit.
+![Lab topology](project_environment.png)
 
----
+## Example run
 
-## Contents
-
-1. [Topology](#topology)
-2. [Repository layout](#repository-layout)
-3. [Prerequisites](#prerequisites)
-4. [Setup](#setup)
-5. [Checking the lab is healthy](#checking-the-lab-is-healthy)
-6. [How the agent works](#how-the-agent-works)
-7. [Guardrails](#guardrails)
-8. [Faults](#faults)
-9. [Running](#running)
-10. [Tests](#tests)
-11. [Troubleshooting](#troubleshooting)
-
----
-
-## Topology
+With fault 1 planted (mismatched hello timers on the r2–r3 link), the agent is given only the symptom. It prints one line per turn, with its reason and the tools it called, then its report (evidence shortened):
 
 ```
-   r1                       r2                       r3
- lo 1.1.1.1/32           lo 2.2.2.2/32           lo 3.3.3.3/32
-   eth1 ───────────────── eth1   eth2 ───────────────── eth1
- 10.0.0.1/30    10.0.0.2/30      10.0.0.5/30    10.0.0.6/30
-        10.0.0.0/30                     10.0.0.4/30
+$ .venv/bin/python -m agent.loop "r1 cannot reach 3.3.3.3 (r3's loopback). Find the cause."
+Turn 1: I'll start by checking r1's routes to see whether it has a route to 3.3.3.3.  ->  routes(r1), ospf_neighbors(r1)
+Turn 2: r1 has no route to 3.3.3.3, though it does have 10.0.0.4/30. Next I'll check r2's neighbors and routes.  ->  ospf_neighbors(r2), routes(r2)
+Turn 3: r2 has no OSPF neighbor on eth2, which faces r3. I'll look at the config on r2 and r3.  ->  running_config(r2), running_config(r3), ospf_neighbors(r3)
+Turn 4: report
+Finished in 4 turns and 7 tool calls.
+Cause: The OSPF adjacency between r2 and r3 is down because of a hello-interval mismatch on the r2–r3 link. r2 eth2 uses a 5s hello interval and r3 eth1 uses the default 10s. r1 therefore never learns 3.3.3.3/32.
+
+Evidence:
+- r2 `ospf_neighbors`: only 1.1.1.1 is listed, and there is no neighbor on eth2.
+- r2 running-config: eth2 (to-r3) has `ip ospf hello-interval 5`.
+- r3 running-config: eth1 (to-r2) has no hello-interval set, so it uses the default of 10s.
+...
+- I didn't read the live timers with a tool. The diagnosis rests on the configs.
+
+Suggested fix: Make the hello intervals match on both ends of the link. Either remove `ip ospf hello-interval 5` from r2 eth2, or set `ip ospf hello-interval 5` on r3 eth1. Also check that the dead intervals agree. After that, confirm that the r2–r3 adjacency reaches Full and that r1 learns 3.3.3.3/32.
 ```
 
-| Router | Router ID | Loopback     | Interfaces                                            |
-|--------|-----------|--------------|-------------------------------------------------------|
-| r1     | 1.1.1.1   | 1.1.1.1/32   | eth1 10.0.0.1/30 (to r2)                              |
-| r2     | 2.2.2.2   | 2.2.2.2/32   | eth1 10.0.0.2/30 (to r1), eth2 10.0.0.5/30 (to r3)    |
-| r3     | 3.3.3.3   | 3.3.3.3/32   | eth1 10.0.0.6/30 (to r2)                              |
+## How it works
 
-OSPF setup (see `networkA/r*/frr.conf`):
+### The lab
 
-- Every interface, loopbacks included, is in **area 0**, set per interface with `ip ospf area 0`.
-- Both links use `ip ospf network point-to-point`, so there's no DR/BDR election.
-- Loopbacks are `passive-interface`. They're advertised but never send hellos.
-- Hello and dead timers are left at the defaults (10s / 40s).
-- Only `ospfd`, `staticd` and `mgmtd` are enabled (`networkA/r*/daemons`).
-- Each node's `exec` step in `networkA/networkA.clab.yml` deletes the Docker default route. That way every route between routers comes from OSPF, and a broken OSPF really does break reachability.
+- Every lab interface, loopbacks included, is in OSPF area 0. Both links are point-to-point, loopbacks are passive, and the timers are FRR's defaults (hello 10 s, dead 40 s).
+- Each router's default route is deleted at deploy (the `exec` step in `networkA/networkA.clab.yml`), so every route between routers comes from OSPF. Without it, traffic with no OSPF route would leave through the management interface, and a ping could pass while the lab was broken.
+- `eth0` on each router is Containerlab's management network (172.20.20.0/24), not part of the lab.
 
-`eth0` on each router is Containerlab's management network (172.20.20.0/24). It isn't part of the lab.
+### Faults
 
----
+Each fault breaks r1's route to 3.3.3.3 in a different way. The scripts in `networkA/faults/` change the running config with `vtysh`, then check r1's routing table every 2 seconds until the route disappears, giving up after 60 seconds. Each has a matching `faultN_undo.sh`, which restores the route within a minute. None of them run `write memory`, so a redeploy also clears a fault.
 
-## Repository layout
+| # | Plant script | What it changes | What the routers show | Time to appear |
+|---|---|---|---|---|
+| 1 | `fault1_hello_mismatch.sh` | `ip ospf hello-interval 5` on r2 eth2; r3 stays at 10 s | The link is up, but r2 and r3 are no longer neighbors | Up to about 40 s, when the dead timer runs out |
+| 2 | `fault2_interface_shutdown.sh` | `shutdown` on r2 eth2 | r2 eth2 is admin down, with no r2–r3 neighbor | Immediate |
+| 3 | `fault3_loopback_not_advertised.sh` | Removes `ip ospf area 0` from r3 lo | All neighbors are `Full`, but 3.3.3.3/32 isn't advertised | Immediate |
 
-```
-FRR/
-├── README.md
-├── CLAUDE.md                     Working rules for the AI assistant on this repo
-├── .env                          ANTHROPIC_API_KEY (not committed)
-├── .gitignore
-│
-├── networkA/                     The lab
-│   ├── networkA.clab.yml         Containerlab topology: 3 FRR nodes, 2 links
-│   ├── vtysh.conf                Shared vtysh config (integrated config mode)
-│   ├── r1/ r2/ r3/
-│   │   ├── frr.conf              Router config (bind-mounted to /etc/frr/frr.conf)
-│   │   └── daemons               Which FRR daemons run
-│   ├── faults/                   Plant/undo scripts for each fault (see Faults)
-│   └── clab-networkA/            Generated by Containerlab at deploy (ignored by git)
-│
-└── agent/                        The agent
-    ├── loop.py                   Agent loop: model calls, tool dispatch, step limit
-    ├── tools.py                  The five read-only tools and their input checks
-    ├── steplog.py                Append-only JSONL step log
-    ├── run_faults.py             Benchmark: plant → diagnose → undo, for every fault
-    ├── requirements.txt          Pinned Python dependencies
-    ├── tests/test_tools.py       Unit tests for the tool guardrails and step log
-    ├── logs/                     Live step log for the current run (ignored by git)
-    ├── results/<timestamp>/      Benchmark output, one folder per batch (committed)
-    └── manual logs/              Earlier step logs from runs done by hand (committed)
-```
+### The agent
 
----
+`agent/loop.py` is a plain tool-use loop over the Anthropic Messages API, with no agent framework:
 
-## Prerequisites
+1. The symptom, given as a command-line argument, goes to the model with a system prompt and five tool definitions.
+2. Each turn (one model call), the model either asks for one or more tool calls or writes its report.
+3. Each tool call runs through `use_tool()`. Its output goes back to the model and into the step log.
+4. The loop ends when the model stops asking for tools, or after 15 turns with `Maximum number of steps reached without a diagnosis.`
 
-Tested with:
+The agent is told only the router names, that they run OSPF, and the symptom: no topology and no list of possible faults. Its report gives the cause, the evidence and a suggested fix, or `Inconclusive` with a summary of what it found.
 
-| Tool        | Version  |
-|-------------|----------|
-| Docker      | 29.8.1   |
-| Containerlab| 0.81.0   |
-| Python      | 3.14.4   |
-| FRR image   | `quay.io/frrouting/frr:10.2.1` (pulled on first deploy) |
-
-It was developed on WSL2. Containerlab needs `sudo`.
-
-You also need an Anthropic API key.
-
----
-
-## Setup
-
-Run everything from the repo root (`FRR/`) unless a step says otherwise.
-
-**1. Deploy the lab**
-
-```bash
-cd networkA
-sudo containerlab deploy -t networkA.clab.yml
-cd ..
-```
-
-This creates the containers `clab-networkA-r1`, `clab-networkA-r2` and `clab-networkA-r3`.
-
-**2. Create the Python environment**
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r agent/requirements.txt
-```
-
-**3. Add your API key**
-
-```bash
-echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env
-```
-
-`agent/loop.py` loads it with `python-dotenv`. `.env` is in `.gitignore`.
-
----
-
-## Checking the lab is healthy
-
-Do this before running the agent or planting a fault. OSPF needs about 10–40 seconds after a deploy before it settles.
-
-```bash
-for r in r1 r2 r3; do docker exec clab-networkA-$r vtysh -c "show ip ospf neighbor"; done
-docker exec clab-networkA-r1 ip route show 3.3.3.3
-docker exec clab-networkA-r1 ping -c 2 3.3.3.3
-```
-
-A healthy lab looks like this:
-
-- **Neighbors:** r1 and r3 each have one neighbor in `Full/-` (2.2.2.2). r2 has two (1.1.1.1 and 3.3.3.3).
-- **Route:** `3.3.3.3 ... via 10.0.0.2 dev eth1 proto ospf metric 20`
-- **Ping:** 0% packet loss
-
-`agent/run_faults.py` uses the route check as its health test (`lab_healthy()`).
-
----
-
-## How the agent works
-
-The agent is a plain tool-use loop over the Anthropic Messages API, in `agent/loop.py`.
-
-1. The problem description (a command-line argument) is sent as the first user message, along with a system prompt and five tool definitions.
-2. Each turn, the model either asks for one or more tool calls or writes its final report.
-3. Each requested tool runs through `use_tool()`. Its output goes back to the model and is written to the step log.
-4. The loop ends when the model stops asking for tools. If it reaches `MAX_STEPS = 15` turns first, it stops and reports `Maximum number of steps reached without a diagnosis.`
-
-The system prompt tells the agent to check one thing at a time, give a one-sentence reason before each call, check rather than assume, and never try to fix anything. The final report has this format:
+<details>
+<summary>The full system prompt</summary>
 
 ```
+You are a network troubleshooting agent for the networkA lab: three FRR routers, r1, r2 and r3, running OSPF. You will be given a problem description. Use the tools to gather information and diagnose the problem. The tools are read-only and thus you cannot change anything on the routers.
+
+Work one check at a time. Before each tool call, log in one sentence why you are making it. Don't make assumptions about the network state, check it with the tools.
+
+Don't try to fix the problem. When you know the cause, stop and reply in this format:
 Cause: <one sentence>
 Evidence: <the tool outputs that prove it>
 Suggested fix: <the change a person should make>
+If you can't determine the cause, reply "Inconclusive" and summarize what you found.
 ```
 
-or `Inconclusive` with a summary of what it found.
+</details>
 
-### Tools
+Each tool runs one fixed command inside a router container through `docker exec` (`agent/tools.py`):
 
-All of them are in `agent/tools.py`. Each one runs a single fixed command inside a router container through `docker exec`.
+| Tool | Command |
+|---|---|
+| `interfaces(router)` | `vtysh -c "show interface brief"` |
+| `ospf_neighbors(router)` | `vtysh -c "show ip ospf neighbor"` |
+| `routes(router)` | `vtysh -c "show ip route"` |
+| `running_config(router)` | `vtysh -c "show running-config"` |
+| `ping(router, target)` | `ping -c 2 -W 2 <target>` |
 
-| Tool             | Inputs            | Command run                     |
-|------------------|-------------------|---------------------------------|
-| `interfaces`     | `router`          | `vtysh -c "show interface brief"` |
-| `ospf_neighbors` | `router`          | `vtysh -c "show ip ospf neighbor"` |
-| `routes`         | `router`          | `vtysh -c "show ip route"`      |
-| `running_config` | `router`          | `vtysh -c "show running-config"` |
-| `ping`           | `router`, `target`| `ping -c 2 -W 2 <target>`       |
+`agent/steplog.py` writes one JSON line per tool call, plus one for the report, with the time (UTC), tool, inputs, output and the model's stated reason. Calls made in the same turn share that reason. For a full example, see [the log of fault 1, run 1](agent/results/2026-10-20_2008/fault1_run1_steps.jsonl).
 
-`router` must be one of `r1`, `r2` or `r3`.
+### Guardrails
 
-### Step log
+Read-only is enforced in code, not only in the prompt:
 
-Every tool call and the final report are appended as one JSON line to `agent/logs/steps.jsonl` by `agent/steplog.py`:
+- **No write tools.** The five tools above are the only ones, and none can change config or interface state. Asking for any other tool returns an error.
+- **Fixed commands.** The model picks a tool and a router, never the command text. That's why the four show commands are separate tools: one "run any show command" tool would let the model send something like `clear ip ospf process`.
+- **Inputs checked before anything runs.** The tool schemas allow only `r1`, `r2` and `r3`, and `tools.py` checks again: the router must be exactly one of the three, and a ping target must parse as an IPv4 address. Bad input goes back to the model as a tool error.
+- **No shell.** Commands go to `subprocess.run` as argument lists, so input like `3.3.3.3; reboot` can't inject anything.
+- **Limits.** Each command times out after 15 seconds, and the loop stops after 15 turns. The turn limit doesn't cap tool calls within a turn; the most seen was 4.
+- **No approval step yet.** Nothing can change config, so there's nothing to approve. It comes with the first tool that can.
 
-```json
-{"time": "2026-10-20T19:46:12+00:00", "tool": "ospf_neighbors", "inputs": {"router": "r2"},
- "output": "...", "reason": "Check whether r2 has formed adjacencies with both neighbors."}
-```
+## Results
 
-The final entry has `"tool": "report"` and `"inputs": {"step": N}`, and its `output` holds the report text. `reason` is the text the model wrote in the same turn as the call.
+The agent found the planted cause in **9 of 9 scripted runs** and **9 of 9 earlier runs done by hand**, 3 per fault in each set. Each run used 3–5 of the 15 allowed turns and took 8–13 seconds from the first check to the report, and no tool call was rejected.
 
-The log is only ever appended to. Delete it between manual runs if you want one log per run. `run_faults.py` handles this for you.
+| Fault | Planted cause | Set | Cause found | Turns | Tool calls |
+|---|---|---|---|---|---|
+| 1 | Hello timer mismatch on r2 eth2 | Scripted | 3/3 | 4, 4, 4 | 7, 7, 7 |
+| | | By hand | 3/3 | 4, 5, 5 | 7, 8, 8 |
+| 2 | r2 eth2 shut down | Scripted | 3/3 | 4, 3, 4 | 8, 5, 6 |
+| | | By hand | 3/3 | 4, 4, 4 | 7, 8, 8 |
+| 3 | r3's loopback not in OSPF | Scripted | 3/3 | 5, 4, 4 | 7, 6, 6 |
+| | | By hand | 3/3 | 5, 4, 5 | 7, 6, 7 |
 
----
+Model: `claude-sonnet-5-5`. Step logs for every run: [scripted](agent/results/2026-10-20_2008/) and [by hand](agent/manual_logs/).
 
-## Guardrails
+### Grading
 
-The agent is read-only by design, and that's enforced in code, not only in the prompt:
+Every run got the same prompt, whichever fault was planted: `"r1 cannot reach 3.3.3.3 (r3's loopback). Find the cause."` A run counts as found only if the report names the specific cause, by rules set before the runs:
 
-- **No write tools.** The only tools are the five above. None of them can change config or interface state. If the model asks for any other tool name, it gets an error back.
-- **Fixed commands.** The model picks a tool and a router. It never writes the command itself.
-- **Inputs are checked before anything runs.** `router` must be exactly `r1`, `r2` or `r3`. The `ping` target must parse as an IPv4 address (`ipaddress.IPv4Address`). Bad input raises `ToolInputError`, which goes back to the model as a tool error.
-- **No shell.** Commands are passed to `subprocess.run` as argument lists, so input like `3.3.3.3; reboot` can't inject anything. The tests check this too.
-- **Timeouts.** Each command has a 15-second limit (`TIMEOUT_SECONDS`), and the whole loop is limited to 15 turns.
+- **Fault 1:** a hello/dead timer mismatch on the r2–r3 link (r2 eth2). "The adjacency is down" alone fails.
+- **Fault 2:** r2 eth2 is administratively shut down. "The r2–r3 link is down" alone fails.
+- **Fault 3:** r3's loopback isn't in OSPF, so it isn't advertised. "3.3.3.3 is unreachable" alone fails, and so does blaming `passive-interface lo`.
 
----
+Each report's evidence was also checked against its step log, and its suggested fix against the planted fault.
 
-## Faults
+### What the agent did
 
-Each fault breaks reachability from r1 to `3.3.3.3` in a different way. The scripts are in `networkA/faults/`. Each script makes its change with `vtysh`, then checks r1's routing table until the route to 3.3.3.3 disappears (plant) or comes back (undo). It gives up after 60 seconds and exits non-zero.
+- Every run made at least two tool calls in one turn (up to 4), even though the prompt says "one check at a time". That's harmless with read-only tools, but it's a small example of why the guardrails are in the code rather than the prompt. The prompt was left as is so every graded run tested the same agent.
+- No evidence line contradicted the step logs, and every suggested fix would have worked. Some reports also said what they hadn't checked, such as "I did not check r3's own configuration."
+- It overstates history. Every report says something "never" happened, as in "r1 never learns 3.3.3.3", although the route existed until the fault was planted. The tools only show the current state.
 
-| # | Plant script | What it breaks | What you see | Undo script |
-|---|--------------|----------------|--------------|-------------|
-| 1 | `fault1_hello_mismatch.sh` | Sets `ip ospf hello-interval 5` on r2 eth2, while r3 eth1 stays at 10s | The link is up but no r2–r3 adjacency forms | `fault1_undo.sh` |
-| 2 | `fault2_interface_shutdown.sh` | Runs `shutdown` on r2 eth2 | r2 eth2 is admin down, no r2–r3 adjacency | `fault2_undo.sh` |
-| 3 | `fault3_loopback_not_advertised.sh` | Removes `ip ospf area 0` from r3 lo | All adjacencies are `Full`, but 3.3.3.3/32 is never advertised | `fault3_undo.sh` |
+### Limits
 
-Run them from anywhere:
+One fault at a time, in a three-router line, each coming down to one config line, with the same prompt every time. Three runs per fault is a small sample: it shows the agent can find these faults, not how often it would fail. Scripted runs also start seconds after the previous fault's undo, so uptime counters show what just changed; the agent remarked on it in 5 of the 9 but never blamed it. Not tested yet: two faults at once, bigger topologies, and vaguer prompts.
 
-```bash
-bash networkA/faults/fault1_hello_mismatch.sh
-bash networkA/faults/fault1_undo.sh
-```
+## How it was built
 
-Faults are only in the **running config**. None of the scripts run `write memory`, so a redeploy also clears them (see [Troubleshooting](#troubleshooting)).
+- I built it with Claude Code. From the task prompts I gave it, one task at a time, it drafted the lab, the fault scripts, the tools and their tests. `CLAUDE.md` holds the scope and rules it reads every session.
+- Each task started in plan mode: I approved or cut its plan, approved its commands one by one, and ran the check myself before committing.
+- I wrote the agent loop myself over two drafts, with Claude reviewing and correcting it in chat.
+- Reviewing each step caught it going off track: once it edited a file without asking because auto mode was on, and once it wrote `no shutdown` in an undo script when my prompt said `shutdown`, guessing what I meant instead of asking.
 
----
+## Running it yourself
 
-## Running
+All commands run from the repo root.
 
-### One diagnosis by hand
+### Prerequisites
+
+- **Linux, or Windows with WSL2.** Tested on WSL2 (Ubuntu). On Windows, install Docker and Containerlab inside WSL.
+- **Docker** (tested with 29.8.1).
+- **Containerlab** (tested with 0.81.0). Its commands need `sudo`.
+- **Python 3 with `venv`** (tested with 3.14). The packages are pinned in `agent/requirements.txt`.
+- **An Anthropic API key** ([how to get one](https://platform.claude.com/docs/en/get-api-key)). API calls are billed per use.
+
+The FRR image, `quay.io/frrouting/frr:10.2.1`, is pulled automatically on the first deploy.
+
+### Installation
+
+1. **Clone the repo.**
+
+   ```bash
+   git clone https://github.com/DrSuriya/network-troubleshooting-agent.git
+   cd network-troubleshooting-agent
+   ```
+
+2. **Deploy the lab.** This starts the containers `clab-networkA-r1`, `clab-networkA-r2` and `clab-networkA-r3`.
+
+   ```bash
+   cd networkA && sudo containerlab deploy -t networkA.clab.yml && cd ..
+   ```
+
+3. **Install the Python packages.**
+
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/pip install -r agent/requirements.txt
+   ```
+
+4. **Add your API key.** Create `.env` in the repo root with an editor, containing one line: `ANTHROPIC_API_KEY=sk-ant-...`.
+
+5. **Check the lab is healthy.** OSPF takes 10–40 seconds to settle after a deploy. Then r1 should have an OSPF route to r3's loopback:
+
+   ```bash
+   docker exec clab-networkA-r1 ip route show 3.3.3.3
+   # 3.3.3.3 nhid 15 via 10.0.0.2 dev eth1 proto ospf metric 20
+   ```
+
+### Diagnose a fault
+
+Plant a fault, give the agent the symptom, then undo the fault:
 
 ```bash
 bash networkA/faults/fault1_hello_mismatch.sh
@@ -244,85 +195,44 @@ bash networkA/faults/fault1_hello_mismatch.sh
 bash networkA/faults/fault1_undo.sh
 ```
 
-The terminal shows a line per turn (`Turn 2: <reason>  ->  ospf_neighbors(r2)`) and then the report. The full trace is in `agent/logs/steps.jsonl`.
+The output looks like the [example run](#example-run) above. The full trace, with every tool's output, is appended to `agent/logs/steps.jsonl`, so delete it between runs if you don't want to store logs from older runs. The other two faults work the same way (just change which fault you are planting).
 
-### The benchmark
+### Run the benchmark
 
 ```bash
-.venv/bin/python -m agent.run_faults            # 3 runs of each fault (9 agent runs)
-.venv/bin/python -m agent.run_faults --runs 1   # quick check: 1 run of each
+.venv/bin/python -m agent.run_faults            # each fault 3 times, about 5 minutes
+.venv/bin/python -m agent.run_faults --runs 1   # quick check: each fault once
 ```
 
-`agent/run_faults.py`:
+`agent/run_faults.py` checks the lab is healthy, then plants each fault in turn, runs the agent, saves the step log and undoes the fault, stopping if a plant or undo fails. Each batch goes to `agent/results/<date>_<time>/`, with a `results.md` that records the model, prompt and git commit, one row per run, and blank "Cause found" and "Notes" columns for grading by hand.
 
-1. Checks the lab is healthy. If it isn't, it runs all three undo scripts. If the lab still isn't healthy, it prints the redeploy command and exits.
-2. For each run and each fault: plants the fault, runs the agent with a fixed prompt (150s timeout), moves the step log into the batch folder, then undoes the fault.
-3. Stops and resets the lab if a plant or undo script fails.
-4. Rewrites `results.md` after every agent run, so a batch that stops partway still has results for the runs it finished.
-
-Output goes to a new timestamped folder:
-
-```
-agent/results/2026-10-20_2008/
-├── fault1_run1_steps.jsonl
-├── fault2_run1_steps.jsonl
-├── ...
-└── results.md
-```
-
-`results.md` records the model, the prompt and the git commit (`git describe --always --dirty`, so `-dirty` means there were uncommitted changes). It has one row per run:
-
-| Column      | Meaning |
-|-------------|---------|
-| Exit code   | Exit code of `agent.loop` (`timeout` if it went over 150s) |
-| Turns       | Model turns until the report |
-| Tool uses   | Number of tool calls |
-| Step limit? | Whether the agent hit `MAX_STEPS` |
-| Cause       | The `Cause:` line from the report |
-| Cause found / Notes | **Left blank on purpose.** Fill these in by hand after reading the report |
-
-Result folders are committed so batches can be compared across models and code versions.
-
----
-
-## Tests
+### Run the tests
 
 ```bash
 .venv/bin/python -m pytest agent/tests
 ```
 
-`agent/tests/test_tools.py` checks the guardrails without touching the lab. `subprocess.run` is patched to fail the test if it's ever called. The tests check:
+The 25 tests check the tool guardrails and the step log without touching the lab.
 
-- Every router tool rejects unknown or malicious router names (`r9`, `r1; reboot`, `""`, `None`).
-- `ping` rejects bad targets (`3.3.3.3; reboot`, `r3`, `3.3.3`, `::1`, `""`, `None`).
-- `log_step` appends one JSON line per call with the expected keys.
+### Troubleshooting
 
----
+- **No OSPF neighbors, and `eth1`/`eth2` are missing:** Docker or WSL restarted and brought the containers back without their links. Redeploy with `cd networkA && sudo containerlab deploy -t networkA.clab.yml --reconfigure && cd ..`, which also clears any planted fault.
 
-## Troubleshooting
+## Directory
 
-**Containers are `Up`, but there are no OSPF neighbors and `eth1`/`eth2` are missing.**
-Docker or WSL restarted and brought the containers back without their links. Containerlab only creates links during `deploy`. Check it with `docker exec clab-networkA-r2 ip link show eth1` (you'll get `Device "eth1" does not exist`). Fix it with:
-
-```bash
-cd networkA && sudo containerlab deploy -t networkA.clab.yml --reconfigure
 ```
-
-**`deploy` fails because the lab already exists.**
-Use `--reconfigure`. It deletes the containers and builds them again from `frr.conf`, which also clears any planted fault. It's slower than the undo scripts but resets everything.
-
-**A fault comes back after a redeploy.**
-Someone ran `write memory` while a fault was active and saved it into the bind-mounted `networkA/rX/frr.conf`. Check with `git status networkA/`, and restore with `git checkout networkA/rX/frr.conf`.
-
-**`No module named agent`, or `.venv/bin/python: No such file or directory`.**
-Run from the repo root. `loop.py` uses absolute imports (`from agent import tools`), so Python has to start in the folder that contains `agent/`, and `.venv` lives there too. From anywhere else, use:
-
-```bash
-PYTHONPATH=~/workspace/FRR ~/workspace/FRR/.venv/bin/python -m agent.loop "..."
+networkA/
+  networkA.clab.yml     Containerlab topology: three FRR routers, two links
+  r1/ r2/ r3/           Each router's frr.conf and daemons file
+  vtysh.conf            Shared vtysh config, mounted into every router
+  faults/               Plant and undo scripts for each fault
+agent/
+  loop.py               Agent loop: model calls, tool allowlist, step limit, logging
+  tools.py              The five read-only tools and their input checks
+  steplog.py            Append-only JSONL step log
+  run_faults.py         Benchmark: plant, diagnose and undo each fault
+  tests/test_tools.py   Tests for the tool guardrails and the step log
+  results/              One folder per benchmark batch
+  manual_logs/          Step logs of the runs done by hand
+CLAUDE.md               Project rules for Claude Code sessions
 ```
-
-**The agent blames OSPF, but the real problem is the lab.**
-Check the lab is healthy ([above](#checking-the-lab-is-healthy)) before planting a fault. If the links are missing, every fault looks the same to the agent.
-
-**Paths with spaces.**
-`agent/manual logs/` has a space in the name, so quote it: `ls "agent/manual logs"`.
